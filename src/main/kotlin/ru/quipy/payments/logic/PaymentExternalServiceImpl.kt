@@ -38,7 +38,6 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    // Используем скользящее окно для более точного ограничения скорости
     private val outboundLimiter =
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
 
@@ -51,14 +50,15 @@ class PaymentExternalSystemAdapterImpl(
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), UUID.randomUUID(), reason = "window-limited before submit")
             }
-            // Возможно, информацию об очереди в будущем можно будет вынести в метрики
+
             logger.warn("[$accountName] Window limited payment $paymentId before outbound call. Queued=${ongoingWindow.awaitingQueueSize()} fair=${ongoingWindow.isFair()}")
             return
         }
 
         timeoutMillis = maxOf(0, deadline - System.currentTimeMillis())
         if (!outboundLimiter.tickBlocking(Duration.ofMillis(timeoutMillis))) {
-            // Если не удалось получить данные в лимит - log и record
+            ongoingWindow.release()
+
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), UUID.randomUUID(), reason = "rate-limited before submit")
             }
