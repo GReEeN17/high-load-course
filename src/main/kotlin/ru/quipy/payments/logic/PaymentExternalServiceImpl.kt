@@ -7,6 +7,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
@@ -36,20 +37,35 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
-    // Используем скользящее окно для более точного ограничения скорости
-    private val outboundLimiter = SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+
+    private val outboundLimiter =
+        SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
+
+    private val ongoingWindow = OngoingWindow(maxWinSize = parallelRequests, fair = true)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val now = System.currentTimeMillis()
-        val timeoutMillis = maxOf(0, deadline - now)
+        var timeoutMillis = maxOf(0, deadline - now)
+        if (!ongoingWindow.tryAcquire(Duration.ofMillis(timeoutMillis))) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), UUID.randomUUID(), reason = "window-limited before submit")
+            }
+
+            logger.warn("[$accountName] Window limited payment $paymentId before outbound call. Queued=${ongoingWindow.awaitingQueueSize()} fair=${ongoingWindow.isFair()}")
+            return
+        }
+
+        timeoutMillis = maxOf(0, deadline - System.currentTimeMillis())
         if (!outboundLimiter.tickBlocking(Duration.ofMillis(timeoutMillis))) {
-            // Если не удалось получить данные в лимит - log и record
+            ongoingWindow.release()
+
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), UUID.randomUUID(), reason = "rate-limited before submit")
             }
             logger.warn("[$accountName] Rate limited payment $paymentId before outbound call")
             return
         }
+
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -73,7 +89,7 @@ class PaymentExternalSystemAdapterImpl(
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -101,6 +117,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.release()
         }
     }
 
