@@ -6,11 +6,12 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "branch": "hw-03",
-  "accounts": "acc-5",
-  "ratePerSecond": 2,
-  "testCount": 500,
-  "processingTimeMillis": 60000,
+  "branch": "hw-05",
+  "accounts": "acc-23",
+  "ratePerSecond": 11,
+  "testCount": 2200,
+  "processingTimeMillis": 13000,
+  "profile": "s_0.7_60",
   "onPremises": true
 }
 
