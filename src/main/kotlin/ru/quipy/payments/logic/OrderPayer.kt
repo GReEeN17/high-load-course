@@ -31,11 +31,11 @@ class OrderPayer(
     // Тест 1: 15 rps - в тесте самом 15
     // Тест 2: 11 rps - в тесте самом 11
     // Тест 3: 100 rps - в тесте самом 3
-    private val intakeRateLimitPerSec = 100
+    private val intakeRateLimitPerSec = 11
     // Тест 1: 5
     // Тест 2: 100 - 4 минуты (надо 3 мин. 30 сек.)
     // Тест 3: 300 - 5 минут (надо 6 мин.)
-    private val intakeQueueCapacity = 300
+    private val intakeQueueCapacity = 80
 
     private val paymentExecutor = ThreadPoolExecutor(
         16, 16, 0L, TimeUnit.MILLISECONDS,
