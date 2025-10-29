@@ -15,6 +15,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -53,29 +54,6 @@ class PaymentExternalSystemAdapterImpl(
     private val ongoingWindow = OngoingWindow(maxWinSize = parallelRequests, fair = true)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val now = System.currentTimeMillis()
-        var timeoutMillis = maxOf(0, deadline - now)
-        if (!ongoingWindow.tryAcquire(Duration.ofMillis(timeoutMillis))) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), UUID.randomUUID(), reason = "window-limited before submit")
-            }
-
-            logger.warn("[$accountName] Window limited payment $paymentId before outbound call. Queued=${ongoingWindow.awaitingQueueSize()} fair=${ongoingWindow.isFair()}")
-            return
-        }
-
-        timeoutMillis = maxOf(0, deadline - System.currentTimeMillis())
-        if (!outboundLimiter.tickBlocking(Duration.ofMillis(timeoutMillis))) {
-            ongoingWindow.release()
-
-            paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), UUID.randomUUID(), reason = "rate-limited before submit")
-            }
-
-            logger.warn("[$accountName] Rate limited payment $paymentId before outbound call")
-            return
-        }
-
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -89,48 +67,112 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            var attempt = 0
+            val maxRetries = 5 // avgProcessingTime = 0.7S, processingTime = 3.5S => processingTime / avgProcessingTime = 5
+            var lastError: Exception? = null
+            var finalBody: ExternalSysResponse? = null
+            var success = false
+
+            while (attempt <= maxRetries) {
+                attempt++
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) {
+                    lastError = SocketTimeoutException("Deadline exceeded before attempt ${attempt + 1}")
+                    break
                 }
 
+                if (!ongoingWindow.tryAcquire(Duration.ofMillis(remaining))) {
+                    lastError = RuntimeException("Window-limited before network call on attempt $attempt")
+                    break
+                }
+
+                val acquiredRate = outboundLimiter.tickBlocking(Duration.ofMillis(remaining))
+                if (!acquiredRate) {
+                    lastError = RuntimeException("Rate-limited during retry before attempt $attempt")
+                    break
+                }
+
+                try {
+                    val call = client.newCall(request)
+                    call.timeout().timeout(remaining, TimeUnit.MILLISECONDS)
+                    call.execute().use { response ->
+                        val bodyJson = response.body?.string()
+                        val parsed = try {
+                            mapper.readValue(bodyJson, ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            lastError = e
+                            logger.error(
+                                "[$accountName] Attempt ${attempt + 1}: failed to parse response. Body=$bodyJson",
+                                e
+                            )
+                            null
+                        }
+
+                        if (parsed != null) {
+                            if (parsed.result) {
+                                finalBody = parsed
+                                success = true
+                            } else {
+                                lastError = RuntimeException(parsed.message ?: "External system returned failure")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    lastError = e
+                    logger.error("[$accountName] Attempt ${attempt + 1}: request failed", e)
+                } finally {
+                    ongoingWindow.release()
+                }
+
+                if (success) break
+
+                if (attempt <= maxRetries) {
+                    val backoffMs = (30L shl (attempt - 1)).coerceAtMost(500L)
+                    val sleepFor = minOf(backoffMs, maxOf(0L, deadline - System.currentTimeMillis()))
+                    if (sleepFor > 0) {
+                        try {
+                            Thread.sleep(sleepFor)
+                        } catch (_: InterruptedException) {
+                        }
+                    }
+                }
+            }
+
+            if (finalBody != null) {
+                val body = finalBody!!
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
                 payCounter.increment()
-            }
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+            } else {
+                val err = lastError ?: RuntimeException("Unknown error")
+                when (err) {
+                    is SocketTimeoutException -> {
+                        logger.error(
+                            "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
+                            err
+                        )
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        }
                     }
-                }
 
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    else -> {
+                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", err)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = err.message)
+                        }
                     }
                 }
             }
         } finally {
-            ongoingWindow.release()
         }
     }
 
