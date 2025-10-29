@@ -73,7 +73,7 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             var attempt = 0
-            val maxRetries = 5 // avgProcessingTime = 0.7S, processingTime = 3.5S => processingTime / avgProcessingTime = 5
+            val maxRetries = 5
             var lastError: Exception? = null
             var finalBody: ExternalSysResponse? = null
             var success = false
@@ -132,7 +132,7 @@ class PaymentExternalSystemAdapterImpl(
                 if (success) break
 
                 if (attempt <= maxRetries) {
-                    val backoffMs = (30L shl (attempt - 1)).coerceAtMost(500L)
+                    val backoffMs = 30L
                     val sleepFor = minOf(backoffMs, maxOf(0L, deadline - System.currentTimeMillis()))
                     if (sleepFor > 0) {
                         try {
