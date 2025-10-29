@@ -73,7 +73,7 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             var attempt = 0
-            val maxRetries = 35
+            val maxRetries = 350
             var lastError: Exception? = null
             var finalBody: ExternalSysResponse? = null
             var success = false
