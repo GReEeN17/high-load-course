@@ -132,7 +132,7 @@ class PaymentExternalSystemAdapterImpl(
                 if (success) break
 
                 if (attempt <= maxRetries) {
-                    val backoffMs = 100L
+                    val backoffMs = 10L
                     val sleepFor = minOf(backoffMs, maxOf(0L, deadline - System.currentTimeMillis()))
                     if (sleepFor > 0) {
                         try {
