@@ -3,7 +3,9 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -32,6 +34,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+
+        private const val QUANTILE_0_85_MULTIPLIER = 1.3
+        private const val DEFAULT_TIMEOUT_MULTIPLIER = 1.5
     }
 
     private val serviceName = properties.serviceName
@@ -40,13 +45,40 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val requestTimeoutMillis: Long = (requestAverageProcessingTime.toMillis() * QUANTILE_0_85_MULTIPLIER).toLong()
 
     private var payCounter = Counter
         .builder("requests.count")
         .tag("action", "asyncPayment")
+        .tag("account", accountName)
         .register(meterRegistry)
 
-    private val client = OkHttpClient.Builder().build()
+    private val retryCounter = Counter
+        .builder("payment.retries.count")
+        .description("Number of retry attempts for payment requests")
+        .tag("account", accountName)
+        .register(meterRegistry)
+
+    private val requestLatencySummary = DistributionSummary
+        .builder("payment.request.latency")
+        .description("Request latency in milliseconds")
+        .tag("account", accountName)
+        .publishPercentiles(0.5, 0.85, 0.99)
+        .register(meterRegistry)
+
+    private val requestLatencyTimer = Timer
+        .builder("payment.request.duration")
+        .description("Request duration in milliseconds")
+        .tag("account", accountName)
+        .publishPercentiles(0.5, 0.85, 0.99)
+        .register(meterRegistry)
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout((requestTimeoutMillis * DEFAULT_TIMEOUT_MULTIPLIER).toLong(), TimeUnit.MILLISECONDS)
+        .readTimeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
+        .writeTimeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
+        .callTimeout((requestTimeoutMillis * DEFAULT_TIMEOUT_MULTIPLIER).toLong(), TimeUnit.MILLISECONDS)
+        .build()
 
     private val outboundLimiter =
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
@@ -97,10 +129,25 @@ class PaymentExternalSystemAdapterImpl(
                     break
                 }
 
+                if (attempt > 1) {
+                    retryCounter.increment()
+                }
+
+                var requestStartTime: Long? = null
                 try {
+                    requestStartTime = System.currentTimeMillis()
                     val call = client.newCall(request)
-                    call.timeout().timeout(remaining, TimeUnit.MILLISECONDS)
+
+                    val timeoutMillis = minOf(requestTimeoutMillis, remaining)
+                    call.timeout().timeout(timeoutMillis, TimeUnit.MILLISECONDS)
+                    
                     call.execute().use { response ->
+                        val requestEndTime = System.currentTimeMillis()
+                        val requestDuration = requestEndTime - requestStartTime
+
+                        requestLatencySummary.record(requestDuration.toDouble())
+                        requestLatencyTimer.record(requestDuration, TimeUnit.MILLISECONDS)
+                        
                         val bodyJson = response.body?.string()
                         val parsed = try {
                             mapper.readValue(bodyJson, ExternalSysResponse::class.java)
@@ -123,6 +170,15 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
                 } catch (e: Exception) {
+                    if (requestStartTime != null) {
+                        val requestEndTime = System.currentTimeMillis()
+                        val requestDuration = requestEndTime - requestStartTime
+                        if (requestDuration > 0) {
+                            requestLatencySummary.record(requestDuration.toDouble())
+                            requestLatencyTimer.record(requestDuration, TimeUnit.MILLISECONDS)
+                        }
+                    }
+                    
                     lastError = e
                     logger.error("[$accountName] Attempt ${attempt + 1}: request failed", e)
                 } finally {
