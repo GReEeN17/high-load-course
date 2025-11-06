@@ -36,7 +36,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         private const val QUANTILE_0_85_MULTIPLIER = 1.3
-        private const val DEFAULT_TIMEOUT_MULTIPLIER = 1.5
     }
 
     private val serviceName = properties.serviceName
@@ -73,12 +72,7 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.5, 0.85, 0.99)
         .register(meterRegistry)
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout((requestTimeoutMillis * DEFAULT_TIMEOUT_MULTIPLIER).toLong(), TimeUnit.MILLISECONDS)
-        .readTimeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
-        .writeTimeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
-        .callTimeout((requestTimeoutMillis * DEFAULT_TIMEOUT_MULTIPLIER).toLong(), TimeUnit.MILLISECONDS)
-        .build()
+    private val client = OkHttpClient.Builder().build()
 
     private val outboundLimiter =
         SlidingWindowRateLimiter(rate = rateLimitPerSec.toLong(), window = Duration.ofSeconds(1))
