@@ -35,7 +35,7 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        private const val QUANTILE_0_85_MULTIPLIER = 1.3
+        private const val QUANTILE_0_85_MULTIPLIER = 1.9
     }
 
     private val serviceName = properties.serviceName
@@ -99,7 +99,7 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             var attempt = 0
-            val maxRetries = 350
+            val maxRetries = 100
             var lastError: Exception? = null
             var finalBody: ExternalSysResponse? = null
             var success = false
@@ -174,7 +174,7 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     
                     lastError = e
-                    logger.error("[$accountName] Attempt ${attempt + 1}: request failed", e)
+                    logger.error("[$accountName] Attempt ${attempt + 1}: request failed.")
                 } finally {
                     ongoingWindow.release()
                 }
@@ -182,7 +182,7 @@ class PaymentExternalSystemAdapterImpl(
                 if (success) break
 
                 if (attempt <= maxRetries) {
-                    val backoffMs = 10L
+                    val backoffMs = 200L
                     val sleepFor = minOf(backoffMs, maxOf(0L, deadline - System.currentTimeMillis()))
                     if (sleepFor > 0) {
                         try {
