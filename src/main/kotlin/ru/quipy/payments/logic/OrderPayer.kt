@@ -28,17 +28,11 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // Тест 1: 15 rps - в тесте самом 15
-    // Тест 2: 11 rps - в тесте самом 11
-    // Тест 3: 100 rps - в тесте самом 3
     private val intakeRateLimitPerSec = 100
-    // Тест 1: 5
-    // Тест 2: 100 - 4 минуты (надо 3 мин. 30 сек.)
-    // Тест 3: 300 - 5 минут (надо 6 мин.)
-    private val intakeQueueCapacity = 300
+    private val intakeQueueCapacity = 1490
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16, 16, 0L, TimeUnit.MILLISECONDS,
+        50, 200, 50L, TimeUnit.MILLISECONDS,
         LinkedBlockingQueue<Runnable>(intakeQueueCapacity),
         NamedThreadFactory("payment-submission-executor"),
         RejectedExecutionHandler { _, _ ->
