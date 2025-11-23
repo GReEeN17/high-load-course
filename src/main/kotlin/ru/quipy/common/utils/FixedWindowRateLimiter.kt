@@ -143,7 +143,7 @@ class CountingRateLimiter(
 
     override fun tickBlocking() {
         while (!tick()) {
-            Thread.sleep(5)
+            // Tight spin-wait without sleep to avoid blocking threads
         }
     }
 
@@ -151,7 +151,7 @@ class CountingRateLimiter(
         val end = System.currentTimeMillis() + timeout.toMillis()
         while (System.currentTimeMillis() <= end) {
             if (tick()) return true
-            Thread.sleep(5)
+            // Tight spin-wait without sleep to avoid blocking threads
         }
         return false
     }

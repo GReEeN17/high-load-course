@@ -2,6 +2,8 @@ package ru.quipy.config
 
 import jakarta.annotation.PostConstruct
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
+import org.eclipse.jetty.server.ServerConnector
+import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
@@ -77,4 +79,5 @@ class EventSourcingLibConfiguration {
         jettyServletWebServerFactory.serverCustomizers.add(c)
         return jettyServletWebServerFactory
     }
+
 }

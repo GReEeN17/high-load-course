@@ -7,61 +7,61 @@ import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeUnit
-import java.time.Duration
-import kotlin.math.min
+import java.util.concurrent.atomic.AtomicInteger
 
 class TokenBucketRateLimiter(
-    private val ratePerSecond: Int,
+    private val rate: Int,
     private val bucketMaxCapacity: Int,
-    private val ticksPerSecond: Int = 50 // гораздо чаще, сглаживает refill
-) : RateLimiter {
+    private val window: Long,
+    private val timeUnit: TimeUnit = TimeUnit.MINUTES,
+): RateLimiter {
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(TokenBucketRateLimiter::class.java)
     }
 
-    private val scope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private val bucket = AtomicInteger(bucketMaxCapacity) // start full
+    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
 
-    init {
-        val refillPerTick = ratePerSecond.toDouble() / ticksPerSecond
-        scope.launch {
-            var carry = 0.0
-            while (true) {
-                carry += refillPerTick
-                val add = carry.toInt()
-                if (add > 0) {
-                    bucket.get().let { cur ->
-                        val toAdd = min(bucketMaxCapacity - cur, add)
-                        if (toAdd > 0) bucket.addAndGet(toAdd)
-                    }
-                    carry -= add
-                }
-                delay(1000L / ticksPerSecond)
+    private var bucket: AtomicInteger = AtomicInteger(0)
+    private var start = System.currentTimeMillis()
+    private var nextExpectedWakeUp = start + timeUnit.toMillis(window)
+
+    private val releaseJob = rateLimiterScope.launch {
+        while (true) {
+            start = System.currentTimeMillis()
+            nextExpectedWakeUp = start + timeUnit.toMillis(window)
+
+            bucket.get().let { cur ->
+                bucket.addAndGet(if (cur + rate > bucketMaxCapacity) bucketMaxCapacity - cur else rate)
             }
+            delay(nextExpectedWakeUp - System.currentTimeMillis())
         }
-    }
+    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
 
     override fun tick(): Boolean {
         while (true) {
-            val cur = bucket.get()
-            if (cur <= 0) return false
-            if (bucket.compareAndSet(cur, cur - 1)) return true
+            val tokensAvailable = bucket.get()
+            if (tokensAvailable <= 0) {
+                return false
+            }
+            val res = bucket.compareAndSet(tokensAvailable, tokensAvailable - 1)
+            if (res) {
+                return true
+            }
         }
     }
 
     override fun tickBlocking() {
         while (!tick()) {
-            Thread.sleep(5)
+            // Tight spin-wait without sleep to avoid blocking threads
         }
     }
 
-    override fun tickBlocking(timeout: Duration): Boolean {
-        val end = System.currentTimeMillis() + timeout.toMillis()
-        while (System.currentTimeMillis() <= end) {
+    override fun tickBlocking(timeout: java.time.Duration): Boolean {
+        val deadline = System.currentTimeMillis() + timeout.toMillis()
+        while (System.currentTimeMillis() <= deadline) {
             if (tick()) return true
-            Thread.sleep(5)
+            // Tight spin-wait without sleep to avoid blocking threads
         }
         return false
     }

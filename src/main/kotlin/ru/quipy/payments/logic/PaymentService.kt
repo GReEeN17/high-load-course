@@ -48,5 +48,3 @@ class ExternalSysResponse(
     val result: Boolean,
     val message: String? = null,
 )
-
-class TooManyRequestsException(val retryAfterMillis: Long) : RuntimeException("Too many requests")
