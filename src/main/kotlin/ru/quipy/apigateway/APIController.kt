@@ -1,23 +1,19 @@
 package ru.quipy.apigateway
 
-import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.http.ResponseEntity
 import org.springframework.http.HttpStatus
-import org.springframework.http.HttpHeaders
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.config.PaymentMetrics
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import ru.quipy.payments.logic.TooManyRequestsException
 import java.util.*
+import java.util.concurrent.RejectedExecutionException
 
 @RestController
-class APIController(
-    meterRegistry: MeterRegistry
-) {
+class APIController {
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
 
@@ -27,10 +23,8 @@ class APIController(
     @Autowired
     private lateinit var orderPayer: OrderPayer
 
-    private var incCounter = Counter
-        .builder("requests.count")
-        .tag("action", "/orders")
-        .register(meterRegistry)
+    @Autowired
+    private lateinit var paymentMetrics: PaymentMetrics
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -38,9 +32,19 @@ class APIController(
     }
 
     data class CreateUserRequest(val name: String, val password: String)
-
     data class User(val id: UUID, val name: String)
 
+    @PostMapping("/orders")
+    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
+        val order = Order(
+            UUID.randomUUID(),
+            userId,
+            System.currentTimeMillis(),
+            OrderStatus.COLLECTING,
+            price,
+        )
+        return orderRepository.save(order)
+    }
 
     data class Order(
         val id: UUID,
@@ -51,28 +55,17 @@ class APIController(
     )
 
     enum class OrderStatus {
-        COLLECTING,
-        PAYMENT_IN_PROGRESS,
-        PAID,
-    }
-
-
-    @PostMapping("/orders")
-    fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): ResponseEntity<Order> {
-        incCounter.increment()
-        val order = Order(
-            UUID.randomUUID(),
-            userId,
-            System.currentTimeMillis(),
-            OrderStatus.COLLECTING,
-            price,
-        )
-        return ResponseEntity.ok(orderRepository.save(order))
+        COLLECTING, PAYMENT_IN_PROGRESS, PAID,
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long
+    ): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
+        paymentMetrics.incomingRequests()
+
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
@@ -80,11 +73,20 @@ class APIController(
 
         return try {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
-        } catch (e: TooManyRequestsException) {
-            val headers = HttpHeaders()
-            headers.add("Retry-After", e.retryAfterMillis.toString())
-            ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).headers(headers).build()
+                ?: return ResponseEntity
+                    .status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header("Retry-After", "1")
+                    .build()
+
+            ResponseEntity
+                .status(HttpStatus.ACCEPTED)
+                .body(PaymentSubmissionDto(createdAt, paymentId))
+        } catch (e: RejectedExecutionException) {
+            paymentMetrics.failedIncomingRequests()
+            ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "1")
+                .build()
         }
     }
 
