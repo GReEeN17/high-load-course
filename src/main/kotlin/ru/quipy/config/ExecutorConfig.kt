@@ -22,7 +22,7 @@ class ExecutorConfig {
             TimeUnit.SECONDS,
             LinkedBlockingQueue(10_000),
             NamedThreadFactory("shared-http"),
-            CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
+            CallerBlockingRejectedExecutionHandler(Duration.ofMillis(200))
         )
     }
 
@@ -33,9 +33,9 @@ class ExecutorConfig {
             200,
             60L,
             TimeUnit.SECONDS,
-            LinkedBlockingQueue(5_000),
+            LinkedBlockingQueue(20_000),
             NamedThreadFactory("shared-db"),
-            CallerBlockingRejectedExecutionHandler(Duration.ofMinutes(30))
+            CallerBlockingRejectedExecutionHandler(Duration.ofMillis(200))
         )
     }
 }

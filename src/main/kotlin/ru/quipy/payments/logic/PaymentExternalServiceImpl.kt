@@ -7,7 +7,6 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.config.PaymentMetrics
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.io.IOException
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.http.HttpClient
@@ -17,8 +16,8 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
-import kotlin.math.min
 import kotlin.random.Random
 
 class PaymentExternalSystemAdapterImpl(
@@ -78,25 +77,27 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
+        .connectTimeout(Duration.ofMillis(500))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val maxRetries = 5
-    private val baseBackoff = Duration.ofMillis(150)
-    private val maxBackoff = Duration.ofSeconds(5)
+    private val maxRetries = 3
+    private val baseBackoff = Duration.ofMillis(30)
+    private val maxBackoff = Duration.ofMillis(200)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
+        val adapterEntryNanos = System.nanoTime()
         val transactionId = UUID.randomUUID()
 
         // Non-blocking rate limiter check
         if (!rateLimiter.tick()) {
             logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
             paymentMetrics.failedIncomingRequests()
+            paymentMetrics.rejectedByRateLimit()
             val currentTime = System.currentTimeMillis()
-            dbExecutor.submit {
+            safeDbSubmit(paymentId) {
                 paymentESService.update(paymentId) {
                     it.logSubmission(false, transactionId, currentTime, Duration.ofMillis(currentTime - paymentStartedAt))
                 }
@@ -104,24 +105,27 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // Non-blocking ongoing window check with timeout
-        if (!ongoingWindow.tryAcquire(Duration.ofMillis(50))) {
+        if (!ongoingWindow.tryAcquire(Duration.ZERO)) {
             logger.warn("[$accountName] Ongoing window full for payment $paymentId")
             paymentMetrics.failedIncomingRequests()
+            paymentMetrics.rejectedByOngoingWindow()
             val currentTime = System.currentTimeMillis()
-            dbExecutor.submit {
+            safeDbSubmit(paymentId) {
                 paymentESService.update(paymentId) {
                     it.logSubmission(false, transactionId, currentTime, Duration.ofMillis(currentTime - paymentStartedAt))
                 }
             }
             return
         }
+
+        paymentMetrics.ongoingWindowAcquired()
 
         val currentTime = System.currentTimeMillis()
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
             paymentMetrics.failedIncomingRequests()
-            dbExecutor.submit {
+            paymentMetrics.rejectedByDeadline()
+            safeDbSubmit(paymentId) {
                 paymentESService.update(paymentId) {
                     it.logSubmission(
                         success = false,
@@ -132,23 +136,36 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
             ongoingWindow.release()
+            paymentMetrics.ongoingWindowReleased()
             return
         }
 
         paymentMetrics.outgoingRequests()
+        paymentMetrics.recordAdapterOverhead(Duration.ofNanos(System.nanoTime() - adapterEntryNanos))
+
         val submissionTime = System.currentTimeMillis()
-        dbExecutor.submit {
+        safeDbSubmit(paymentId) {
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, submissionTime, Duration.ofMillis(submissionTime - paymentStartedAt))
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         // Fire and forget async payment with proper cleanup
         attemptPayment(paymentId, amount, transactionId, paymentStartedAt, deadline, 0)
             .whenComplete { result, error ->
                 ongoingWindow.release()
+                paymentMetrics.ongoingWindowReleased()
+                paymentMetrics.recordEndToEnd(Duration.ofMillis(System.currentTimeMillis() - paymentStartedAt))
+
+                when (result) {
+                    is PaymentResult.Success -> paymentMetrics.completedSuccess()
+                    is PaymentResult.Failure -> paymentMetrics.completedFailure()
+                    is PaymentResult.DeadlineExceeded -> paymentMetrics.completedDeadlineExceeded()
+                    null -> {}
+                }
+
                 if (error != null) {
                     logger.error("[$accountName] Unexpected error processing payment $paymentId", error)
                 }
@@ -168,7 +185,7 @@ class PaymentExternalSystemAdapterImpl(
         val nowTime = System.currentTimeMillis()
         if (nowTime > deadline) {
             paymentMetrics.failedOutgoingRequests()
-            dbExecutor.submit {
+            safeDbSubmit(paymentId) {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, nowTime, transactionId, reason = "Deadline exceeded.")
                 }
@@ -176,10 +193,7 @@ class PaymentExternalSystemAdapterImpl(
             return CompletableFuture.completedFuture(PaymentResult.DeadlineExceeded)
         }
 
-        val timeoutMillis = min(
-            (deadline - nowTime).coerceAtLeast(1),
-            requestAverageProcessingTime.toMillis().coerceAtLeast(1000L) + 2000L
-        ).coerceAtLeast(1000L)
+        val timeoutMillis = (deadline - nowTime - 50).coerceIn(50, 950)
 
         val uri = URI.create(
             "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
@@ -222,7 +236,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 val processingTime = System.currentTimeMillis()
-                dbExecutor.submit {
+                safeDbSubmit(paymentId) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(bodyObj.result, processingTime, transactionId, reason = bodyObj.message)
                     }
@@ -237,7 +251,7 @@ class PaymentExternalSystemAdapterImpl(
 
                 val errorTime = System.currentTimeMillis()
                 val reason = if (error.cause is SocketTimeoutException) "Request timeout." else error.message
-                dbExecutor.submit {
+                safeDbSubmit(paymentId) {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, errorTime, transactionId, reason = reason)
                     }
@@ -289,6 +303,14 @@ class PaymentExternalSystemAdapterImpl(
                 || e is java.net.ConnectException
                 || e is java.net.SocketException
                 || e is java.io.InterruptedIOException
+    }
+
+    private fun safeDbSubmit(paymentId: UUID, block: () -> Unit) {
+        try {
+            dbExecutor.submit(block)
+        } catch (e: RejectedExecutionException) {
+            logger.warn("[$accountName] DB executor rejected write for payment $paymentId")
+        }
     }
 
     private fun calcBackoffMillis(attempt: Int): Long {

@@ -83,6 +83,7 @@ class APIController {
                 .body(PaymentSubmissionDto(createdAt, paymentId))
         } catch (e: RejectedExecutionException) {
             paymentMetrics.failedIncomingRequests()
+            paymentMetrics.rejectedByExecutor()
             ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
