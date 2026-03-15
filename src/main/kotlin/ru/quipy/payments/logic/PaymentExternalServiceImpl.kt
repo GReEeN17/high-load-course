@@ -3,7 +3,6 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import ru.quipy.common.utils.OngoingWindow
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.config.PaymentMetrics
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -69,10 +68,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val client: HttpClient = HttpClient.newBuilder()
@@ -85,59 +81,25 @@ class PaymentExternalSystemAdapterImpl(
     private val baseBackoff = Duration.ofMillis(30)
     private val maxBackoff = Duration.ofMillis(200)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): Boolean {
         logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val adapterEntryNanos = System.nanoTime()
         val transactionId = UUID.randomUUID()
 
-        // Non-blocking rate limiter check
-        if (!rateLimiter.tick()) {
-            logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
-            paymentMetrics.failedIncomingRequests()
-            paymentMetrics.rejectedByRateLimit()
-            val currentTime = System.currentTimeMillis()
-            safeDbSubmit(paymentId) {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, currentTime, Duration.ofMillis(currentTime - paymentStartedAt))
-                }
-            }
-            return
-        }
-
         if (!ongoingWindow.tryAcquire(Duration.ZERO)) {
-            logger.warn("[$accountName] Ongoing window full for payment $paymentId")
-            paymentMetrics.failedIncomingRequests()
             paymentMetrics.rejectedByOngoingWindow()
-            val currentTime = System.currentTimeMillis()
-            safeDbSubmit(paymentId) {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, currentTime, Duration.ofMillis(currentTime - paymentStartedAt))
-                }
-            }
-            return
+            return false
         }
 
         paymentMetrics.ongoingWindowAcquired()
 
         val currentTime = System.currentTimeMillis()
         if (currentTime > deadline) {
-            logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
-            paymentMetrics.failedIncomingRequests()
             paymentMetrics.rejectedByDeadline()
-            safeDbSubmit(paymentId) {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(
-                        success = false,
-                        transactionId,
-                        currentTime,
-                        Duration.ofMillis(currentTime - paymentStartedAt),
-                    )
-                }
-            }
             ongoingWindow.release()
             paymentMetrics.ongoingWindowReleased()
-            return
+            return false
         }
 
         paymentMetrics.outgoingRequests()
@@ -170,6 +132,8 @@ class PaymentExternalSystemAdapterImpl(
                     logger.error("[$accountName] Unexpected error processing payment $paymentId", error)
                 }
             }
+
+        return true
     }
 
     private fun attemptPayment(
@@ -294,20 +258,15 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
     override fun name() = properties.accountName
 
-    private fun shouldRetry(status: Int): Boolean {
-        return status == 408 || status == 429 || status in 500..599
-    }
-
-    private fun isRetriableException(e: Exception): Boolean {
-        return e is SocketTimeoutException
-                || e is java.net.ConnectException
-                || e is java.net.SocketException
-                || e is java.io.InterruptedIOException
-    }
-
     private fun safeDbSubmit(paymentId: UUID, block: () -> Unit) {
         try {
-            dbExecutor.submit(block)
+            dbExecutor.submit {
+                try {
+                    block()
+                } catch (e: Exception) {
+                    logger.debug("[$accountName] DB write failed for payment $paymentId: ${e.message}")
+                }
+            }
         } catch (e: RejectedExecutionException) {
             logger.warn("[$accountName] DB executor rejected write for payment $paymentId")
         }

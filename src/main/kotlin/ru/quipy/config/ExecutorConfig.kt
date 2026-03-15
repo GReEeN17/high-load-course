@@ -2,8 +2,8 @@ package ru.quipy.config
 
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
-import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.NamedThreadFactory
 import java.time.Duration
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.LinkedBlockingQueue
@@ -33,9 +33,9 @@ class ExecutorConfig {
             200,
             60L,
             TimeUnit.SECONDS,
-            LinkedBlockingQueue(20_000),
+            LinkedBlockingQueue(50_000),
             NamedThreadFactory("shared-db"),
-            CallerBlockingRejectedExecutionHandler(Duration.ofMillis(200))
+            ThreadPoolExecutor.AbortPolicy()
         )
     }
 }
