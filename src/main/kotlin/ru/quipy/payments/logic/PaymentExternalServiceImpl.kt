@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.config.PaymentMetrics
 import ru.quipy.core.EventSourcingService
@@ -26,7 +27,8 @@ class PaymentExternalSystemAdapterImpl(
     private val token: String,
     private val paymentMetrics: PaymentMetrics,
     private val httpExecutor: java.util.concurrent.ExecutorService,
-    private val dbExecutor: java.util.concurrent.ExecutorService
+    private val dbExecutor: java.util.concurrent.ExecutorService,
+    private val circuitBreaker: CircuitBreaker
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -87,7 +89,13 @@ class PaymentExternalSystemAdapterImpl(
         val adapterEntryNanos = System.nanoTime()
         val transactionId = UUID.randomUUID()
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            paymentMetrics.rejectedByCircuitBreaker()
+            return false
+        }
+
         if (!ongoingWindow.tryAcquire(Duration.ZERO)) {
+            circuitBreaker.releasePermission()
             paymentMetrics.rejectedByOngoingWindow()
             return false
         }
@@ -97,6 +105,7 @@ class PaymentExternalSystemAdapterImpl(
         val currentTime = System.currentTimeMillis()
         if (currentTime > deadline) {
             paymentMetrics.rejectedByDeadline()
+            circuitBreaker.releasePermission()
             ongoingWindow.release()
             paymentMetrics.ongoingWindowReleased()
             return false
@@ -114,19 +123,31 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        // Fire and forget async payment with proper cleanup
+        val cbStartMillis = System.currentTimeMillis()
+
         attemptPayment(paymentId, amount, transactionId, paymentStartedAt, deadline, 0)
             .whenComplete { result, error ->
+                val elapsedMs = System.currentTimeMillis() - cbStartMillis
+
+                when (result) {
+                    is PaymentResult.Success -> {
+                        circuitBreaker.onSuccess(elapsedMs, TimeUnit.MILLISECONDS)
+                        paymentMetrics.completedSuccess()
+                    }
+                    is PaymentResult.Failure -> {
+                        circuitBreaker.onError(elapsedMs, TimeUnit.MILLISECONDS, RuntimeException(result.message))
+                        paymentMetrics.completedFailure()
+                    }
+                    is PaymentResult.DeadlineExceeded -> {
+                        circuitBreaker.onError(elapsedMs, TimeUnit.MILLISECONDS, RuntimeException("Deadline exceeded"))
+                        paymentMetrics.completedDeadlineExceeded()
+                    }
+                    null -> {}
+                }
+
                 ongoingWindow.release()
                 paymentMetrics.ongoingWindowReleased()
                 paymentMetrics.recordEndToEnd(Duration.ofMillis(System.currentTimeMillis() - paymentStartedAt))
-
-                when (result) {
-                    is PaymentResult.Success -> paymentMetrics.completedSuccess()
-                    is PaymentResult.Failure -> paymentMetrics.completedFailure()
-                    is PaymentResult.DeadlineExceeded -> paymentMetrics.completedDeadlineExceeded()
-                    null -> {}
-                }
 
                 if (error != null) {
                     logger.error("[$accountName] Unexpected error processing payment $paymentId", error)

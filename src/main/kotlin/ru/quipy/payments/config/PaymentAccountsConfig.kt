@@ -3,6 +3,7 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -41,7 +42,8 @@ class PaymentAccountsConfig {
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         paymentMetrics: PaymentMetrics,
         sharedHttpExecutor: java.util.concurrent.ExecutorService,
-        sharedDbExecutor: java.util.concurrent.ExecutorService
+        sharedDbExecutor: java.util.concurrent.ExecutorService,
+        paymentCircuitBreaker: CircuitBreaker
     ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
@@ -58,6 +60,7 @@ class PaymentAccountsConfig {
             .filter { it.accountName in allowedAccounts }
             .map { it.copy(enabled = true) }
             .onEach(::println)
+            .also { paymentMetrics.registerCircuitBreaker(paymentCircuitBreaker) }
             .map {
                 PaymentExternalSystemAdapterImpl(
                     it,
@@ -66,7 +69,8 @@ class PaymentAccountsConfig {
                     token,
                     paymentMetrics,
                     sharedHttpExecutor,
-                    sharedDbExecutor
+                    sharedDbExecutor,
+                    paymentCircuitBreaker
                 )
             }
     }

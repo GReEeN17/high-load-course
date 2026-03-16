@@ -1,5 +1,6 @@
 package ru.quipy.config
 
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import org.springframework.stereotype.Component
@@ -29,6 +30,7 @@ class PaymentMetrics(private val registry: MeterRegistry) {
     private val rejectedByOngoingWindow = registry.counter("payment_rejected", "reason", "ongoing_window")
     private val rejectedByDeadline = registry.counter("payment_rejected", "reason", "deadline_exceeded")
     private val rejectedByExecutor = registry.counter("payment_rejected", "reason", "executor_full")
+    private val rejectedByCircuitBreaker = registry.counter("payment_rejected", "reason", "circuit_breaker_open")
 
     // --- outcome counters ---
     private val outcomeSuccess = registry.counter("payment_completed", "outcome", "success")
@@ -46,6 +48,19 @@ class PaymentMetrics(private val registry: MeterRegistry) {
         registry.gauge("payment_executor_queue_size", executor) { it.queue.size.toDouble() }
         registry.gauge("payment_executor_active_threads", executor) { it.activeCount.toDouble() }
         registry.gauge("payment_executor_pool_size", executor) { it.poolSize.toDouble() }
+    }
+
+    fun registerCircuitBreaker(cb: CircuitBreaker) {
+        registry.gauge("circuit_breaker_state", cb) {
+            when (it.state) {
+                CircuitBreaker.State.CLOSED -> 0.0
+                CircuitBreaker.State.OPEN -> 1.0
+                CircuitBreaker.State.HALF_OPEN -> 2.0
+                CircuitBreaker.State.DISABLED -> -1.0
+                CircuitBreaker.State.FORCED_OPEN -> 3.0
+                else -> -2.0
+            }
+        }
     }
 
     // --- existing ---
@@ -67,6 +82,7 @@ class PaymentMetrics(private val registry: MeterRegistry) {
     fun rejectedByOngoingWindow() = rejectedByOngoingWindow.increment()
     fun rejectedByDeadline() = rejectedByDeadline.increment()
     fun rejectedByExecutor() = rejectedByExecutor.increment()
+    fun rejectedByCircuitBreaker() = rejectedByCircuitBreaker.increment()
 
     // --- outcomes ---
     fun completedSuccess() = outcomeSuccess.increment()
